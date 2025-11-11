@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-judge-backend
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ai-judge-backend
+  template:
+    metadata:
+      labels:
+        app: ai-judge-backend
+    spec:
+      containers:
+      - name: backend
+        image: ai-judge-backend:latest
+        ports:
+        - containerPort: 8000
+        env:
+        - name: GROQ_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: ai-judge-secrets
+              key: groq-api-key
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-judge-backend-service
+spec:
+  selector:
+    app: ai-judge-backend
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8000
+  type: LoadBalancer
