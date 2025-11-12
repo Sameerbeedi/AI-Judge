@@ -10,6 +10,9 @@ import docx
 import io
 from datetime import datetime
 
+# Import the preprocessing module
+from argument_preprocessor import preprocessor, ArgumentSequencer
+
 # Load environment variables
 load_dotenv()
 
@@ -29,6 +32,9 @@ client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 # In-memory storage (replace with database for production)
 cases = {}
+
+# Argument sequence tracker
+argument_sequences = {}  # case_id -> list of arguments in order
 
 class CaseCreate(BaseModel):
     case_id: str
@@ -154,8 +160,8 @@ def create_case(case: CaseCreate):
     """Create a new case"""
     cases[case.case_id] = {
         "case_id": case.case_id,
-        "side_a": {"text": "", "files": []},
-        "side_b": {"text": "", "files": []},
+        "side_a": {"text": "", "files": [], "points": [], "metadata": {}},
+        "side_b": {"text": "", "files": [], "points": [], "metadata": {}},
         "status": "collecting_evidence",
         "follow_ups": [],
         "follow_up_count": 0,
@@ -165,29 +171,83 @@ def create_case(case: CaseCreate):
 
 @app.post("/api/case/{case_id}/upload/{side}")
 async def upload_document(case_id: str, side: str, files: List[UploadFile] = File(...)):
-    """Upload documents for a side"""
+    """Upload and preprocess documents for a side"""
     if case_id not in cases:
         raise HTTPException(status_code=404, detail="Case not found")
     
     if side not in ["A", "B"]:
         raise HTTPException(status_code=400, detail="Side must be 'A' or 'B'")
     
-    side_key = f"side_{side.lower()}"
-    extracted_texts = []
-    
-    for file in files:
-        content = await file.read()
-        text = extract_text_from_file(content, file.filename)
-        extracted_texts.append(text)
-        cases[case_id][side_key]["files"].append({
-            "filename": file.filename,
-            "text": text
+    try:
+        # Use preprocessor to handle files
+        processed_data = await preprocessor.process_multiple_files(files, side)
+        
+        side_key = f"side_{side.lower()}"
+        
+        # Store processed data
+        cases[case_id][side_key]["text"] = processed_data['combined_text']
+        cases[case_id][side_key]["files"] = processed_data['files']
+        cases[case_id][side_key]["points"] = processed_data['all_points']
+        cases[case_id][side_key]["metadata"] = processed_data['summary']
+        
+        # Initialize or update argument sequence
+        if case_id not in argument_sequences:
+            argument_sequences[case_id] = []
+        
+        # Add to sequence with order
+        argument_sequences[case_id].append({
+            'side': side,
+            'order': len(argument_sequences[case_id]) + 1,
+            'text': processed_data['combined_text'],
+            'point_count': len(processed_data['all_points'])
         })
+        
+        return {
+            "message": f"Files uploaded and processed for Side {side}",
+            "processed_data": {
+                "file_count": processed_data['summary']['file_count'],
+                "total_words": processed_data['summary']['total_words'],
+                "total_points": processed_data['summary']['total_points'],
+                "formats_detected": processed_data['summary']['formats_used'],
+                "argument_sequence_position": len(argument_sequences[case_id])
+            },
+            "files": [{"filename": f['filename'], "points": len(f['points'])} for f in processed_data['files']]
+        }
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing files: {str(e)}")
+
+
+@app.get("/api/case/{case_id}/validate")
+def validate_case_arguments(case_id: str):
+    """Validate case arguments before proceeding to verdict"""
+    if case_id not in cases:
+        raise HTTPException(status_code=404, detail="Case not found")
     
-    return {
-        "message": f"Files uploaded for Side {side}",
-        "extracted_texts": extracted_texts
-    }
+    case_data = cases[case_id]
+    
+    # Validate both sides have arguments
+    validation_result = preprocessor.validate_case_arguments(
+        case_data['side_a'],
+        case_data['side_b']
+    )
+    
+    # Add sequence information
+    if case_id in argument_sequences:
+        sequence_info = ArgumentSequencer.process_argument_sequence(
+            argument_sequences[case_id]
+        )
+        validation_result['sequence'] = {
+            'total_rounds': sequence_info['total_rounds'],
+            'is_balanced': sequence_info['is_balanced'],
+            'arguments_order': [
+                f"Round {i+1}: Side {arg['side']}" 
+                for i, arg in enumerate(argument_sequences[case_id])
+            ]
+        }
+    
+    return validation_result
 
 @app.post("/api/case/{case_id}/argument/{side}")
 def submit_argument(case_id: str, side: str, data: dict):
@@ -205,11 +265,20 @@ def submit_argument(case_id: str, side: str, data: dict):
 
 @app.post("/api/case/{case_id}/get-verdict")
 def get_verdict(case_id: str):
-    """Get AI Judge verdict"""
+    """Get AI Judge verdict - returns existing verdict if already decided"""
     if case_id not in cases:
         raise HTTPException(status_code=404, detail="Case not found")
     
     case = cases[case_id]
+    
+    # Check if verdict already exists
+    if case.get('verdict') and case.get('status') == 'decided':
+        return {
+            "verdict": case['verdict']['text'],
+            "timestamp": case['verdict']['timestamp'],
+            "cached": True,
+            "message": "Returning existing verdict for this case"
+        }
     
     # Check if both sides have submitted
     if not case['side_a']['text'] and not case['side_a']['files']:
